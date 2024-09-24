@@ -1,3 +1,8 @@
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -17,42 +22,28 @@ load_dotenv()
 
 app = FastAPI()
 
-# RAG 모델 초기화 (CPU 버전)
-try:
-    RAG = RAGMultiModalModel.from_pretrained("vidore/colpali-v1.2", verbose=1, device="cpu")
+# RAG 모델 초기화를 함수로 분리
+def initialize_rag_model():
+    try:
+        return RAGMultiModalModel.from_pretrained("vidore/colpali", verbose=1, device="cpu")
+    except Exception as e:
+        logger.error(f"RAG 모델 초기화 실패: {str(e)}", exc_info=True)
+        raise
+
+# 전역 변수로 선언
+RAG = None
+
+@app.on_event("startup")
+async def startup_event():
+    global RAG
+    RAG = initialize_rag_model()
     logger.info("RAG 모델 초기화 성공")
-except Exception as e:
-    logger.error(f"RAG 모델 초기화 실패: {str(e)}", exc_info=True)
-    raise
 
 import pdfplumber
 import io
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 
-def index_document(file_path):
-    with pdfplumber.open(file_path) as pdf:
-        text = ""
-        for page in pdf.pages:
-            text += page.extract_text()
-        
-        # 텍스트를 새 PDF로 변환
-        pdf_buffer = io.BytesIO()
-        c = canvas.Canvas(pdf_buffer, pagesize=letter)
-        textobject = c.beginText(40, 750)
-        for line in text.split('\n'):
-            textobject.textLine(line)
-        c.drawText(textobject)
-        c.save()
-        pdf_buffer.seek(0)
-        
-        # 메모리 내 PDF 파일을 사용하여 인덱싱
-        RAG.index(
-            input_path=pdf_buffer,
-            index_name="korean_doc",
-            store_collection_with_index=True,
-            overwrite=True
-        )
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -113,6 +104,9 @@ logger = logging.getLogger(__name__)
 
 @app.post("/upload_document")
 async def upload_document(file: UploadFile = File(...)):
+    if RAG is None:
+        return JSONResponse(content={"message": "RAG 모델이 초기화되지 않았습니다."}, status_code=500)
+    
     temp_file_path = f"temp_{file.filename}"
     try:
         with open(temp_file_path, "wb") as buffer:
@@ -129,6 +123,9 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.post("/query")
 async def query(question: str = Form(...)):
+    if RAG is None:
+        return JSONResponse(content={"message": "RAG 모델이 초기화되지 않았습니다."}, status_code=500)
+    
     results = RAG.search(question, k=1)
     if results:
         image_base64 = results[0].base64
@@ -139,6 +136,10 @@ async def query(question: str = Form(...)):
         }, status_code=200)
     else:
         return JSONResponse(content={"message": "관련 정보를 찾을 수 없습니다."}, status_code=404)
+
+@app.get("/status")
+async def get_status():
+    return {"rag_model_initialized": RAG is not None}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
